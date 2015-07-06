@@ -1,9 +1,9 @@
 local function parse(str, pos)
-  local read, readchar, readcharws, peekchar, eof
+  local read, readchar, readcharws, peekchar, peekcharws, eof
   pos = pos or 1
   local readtable = {
     ['^"'] = function()
-      local escape = {
+      local escape_tbl = {
         ['\\'] = '\\',
         ['"'] = '"'
       }
@@ -102,6 +102,14 @@ local function map(tbl, fn, ctx)
   return out
 end
 
+local function hashtokv(tbl)
+  local out = {}
+  for k, v in pairs(tbl) do
+    out[#out + 1] = {k, v}
+  end
+  return out
+end
+
 local function reduce(tbl, fn, acc, ctx)
   for _, v in ipairs(tbl) do
     acc = fn(acc, v, ctx)
@@ -136,12 +144,33 @@ local function makectx(parent, new)
   return setmetatable(new, { __index = parent })
 end
 
-function print_sexp(sexp)
+local function isarray(tbl)
+  local last = 0
+  for k, _ in pairs(tbl) do
+    if type(k) ~= 'number' or k ~= last + 1 then
+      return false
+    end
+    last = k
+  end
+  return true
+end
+
+function print_sexp(sexp, memo)
+  memo = memo or {}
   local t = type(sexp)
+  if t == 'table' and not t.symbol and memo[sexp] then
+    return '<recursive>'
+  end
   if t == 'table' and sexp.symbol then
     return sexp.symbol
+  elseif t == 'table' and isarray(sexp) then
+    memo[sexp] = true
+    return ('(%s)'):format(table.concat(map(sexp, print_sexp, memo), ' '))
   elseif t == 'table' then
-    return ('(%s)'):format(table.concat(map(sexp, print_sexp), ' '))
+    memo[sexp] = true
+    return ('{%s}'):format(table.concat(map(hashtokv(sexp), function(k)
+                                              return table.concat(map(k, print_sexp, memo), ' ')
+                                           end), ', '))
   elseif t == 'string' then
     return ('%q'):format(sexp)
   elseif t == 'nil' then
@@ -154,15 +183,38 @@ end
 function eval(sexp, ctx)
   local t = type(sexp)
   if t == 'table' and sexp.symbol then
-    return assert(ctx[sexp.symbol], ("%s is not bound"):format(sexp.symbol))
+    return assert(ctx[sexp.symbol], ("%s is not bound in context %s"):format(sexp.symbol, print_sexp(ctx)))
   elseif t == 'table' then
+    print("EVAL", print_sexp(sexp))
     local fn, args = split(unpack(sexp))
     local fv = eval(fn, ctx)
     assert(type(fv) == 'function', ("expected fv to be a function, not %s (from %s)"):format(fv, print_sexp(fn)))
-    return fv(eval, ctx, args)
+    return fv(eval, ctx, args, {name = print_sexp(fn)})
+  elseif t == 'function' then
+    return sexp(eval, ctx, nil)
   else
     return sexp
   end
+end
+
+local function assign(to, name, values)
+  print(("assign %s <- %s (a: %s)"):format(print_sexp(name), print_sexp(values), print_sexp(to)))
+  if name.symbol then
+    to[name.symbol] = values
+  else
+    for k, item in ipairs(name) do
+      if item.symbol == '&rest' then
+        local nv, tbl = name[k + 1], {}
+        for n = k, #values do
+          tbl[#tbl + 1] = values[n]
+        end
+        to[nv.symbol] = tbl
+        return to
+      end
+      assign(to, item, values[k])
+    end
+  end
+  return to
 end
 
 local ctx = {
@@ -176,6 +228,25 @@ local ctx = {
   ["<"] = wrap(function(a, b) return a < b end),
   [">"] = wrap(function(a, b) return a > b end),
 
+  ["not"] = wrap(function(a) return not a end),
+
+  ["symbol?"] = wrap(function(e)
+      return type(e) == 'table' and e.symbol
+  end),
+  ["list?"] = wrap(function(e)
+      return type(e) == 'table' and not e.symbol
+  end),
+  ["string?"] = wrap(function(e)
+      return type(e) == 'string'
+  end),
+  ["nil?"] = wrap(function(e)
+      return type(e) == 'nil'
+  end),
+
+  ["symbol->string"] = wrap(function(e)
+      return e.symbol
+  end),
+
   display = wrap(print),
   print = wrap(print_sexp),
 
@@ -186,13 +257,53 @@ local ctx = {
   end,
   lambda = function(eval, pctx, args)
     local vars, body = unpack(args)
-    return function(eval, ctx, args)
+    return function(eval, ctx, args, dbg)
+      print("ARGS", print_sexp(args))
       local nctx = makectx(pctx, {})
-      for k, v in ipairs(vars) do
-        nctx[v.symbol] = eval(args[k], ctx)
+      -- print(("CALL\t%s with %s"):format(dbg.name, print_sexp(args)))
+      local eargs
+      if args.symbol then
+        eargs = eval(args, ctx)
+      else
+        eargs = map(args, eval, ctx)
       end
+      assign(nctx, vars, eargs)
       return eval(body, nctx)
     end
+  end,
+  defmacro = function(eval, ctx, args)
+    local name, vars, body = unpack(args)
+    ctx[name.symbol] = function(eval, fctx, args, dbg)
+      local mctx = makectx(ctx, {})
+      assign(mctx, vars, args)
+      print(("MACRO\t%s with %s"):format(dbg.name, print_sexp(mctx)))
+      print("MBEFORE", print_sexp(args))
+      local newbody = eval(body, mctx)
+      print(" MAFTER", print_sexp(newbody))
+      return eval(newbody, fctx)
+    end
+  end,
+  quote = function(eval, ctx, args)
+    return args
+  end,
+  quasiquote = function(eval, ctx, args)
+    local function recurse(sexp)
+      if type(sexp) == 'table' and not sexp.symbol then
+        if type(sexp[1]) == 'table' and sexp[1].symbol == 'unquote' then
+          return eval(sexp[2], ctx)
+        end
+        local dup = {}
+        for k, v in ipairs(sexp) do
+          dup[k] = recurse(v)
+        end
+        return dup
+      end
+      return sexp
+    end
+    return recurse(args)
+  end,
+  list = function(eval, ctx, args)
+    return map(args, eval, ctx)
   end,
   let = function(eval, ctx, args)
     local bindings, body = unpack(args)
@@ -203,6 +314,21 @@ local ctx = {
     end
     return eval(body, nctx)
   end,
+  letrec = function(eval, ctx, args)
+    local bindings, body = unpack(args)
+    local nctx = makectx(ctx, {})
+    for _, v in ipairs(bindings) do
+      local name, val = unpack(v)
+      nctx[name.symbol] = eval(val, nctx)
+    end
+    return eval(body, nctx)
+  end,
+  ["destructuring-bind"] = function(eval, ctx, args)
+    local binding, expression, body = unpack(args)
+    local nctx = makectx(ctx, {})
+    assign(nctx, binding, eval(expression, ctx))
+    return eval(body, nctx)
+  end,
   ["if"] = function(eval, ctx, args)
     local cond, iftrue, iffalse = unpack(args)
     if eval(cond, ctx) then
@@ -210,12 +336,42 @@ local ctx = {
     else
       return eval(iffalse, ctx)
     end
-  end
+  end,
+  get = wrap(function(tbl, key, default)
+      return tbl[key] or default
+  end),
+  set = wrap(function(tbl, key, value)
+      tbl[key] = value
+      return tbl
+  end),
+  len = wrap(function(e)
+      return #e
+  end),
+  call = wrap(function(fn, ...)
+      return fn(...)
+  end),
+  apply = function(eval, ctx, args)
+    local fn, args = unpack(args)
+    print("APPLY", print_sexp(fn), print_sexp(args))
+    return eval(fn, ctx)(eval, ctx, args, {name = print_sexp(fn)})
+  end,
+  -- Lua = _G,
+  map = function(eval, ctx, args)
+    local fn, args = unpack(args)
+    local fv, av = eval(fn, ctx), eval(args, ctx)
+    local out = {}
+    for k, v in ipairs(av) do
+      out[k] = fv(eval, ctx, {function() return v end})
+    end
+    return out
+  end,
 }
+
+ctx.ctx = ctx
 
 local code
 do
-  local sf = io.open('scratch.lisp', 'rb')
+  local sf = io.open(select(1, ...) or 'eval.lisp', 'r')
   code = sf:read '*all'
   sf:close()
 end

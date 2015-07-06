@@ -30,13 +30,16 @@
                (* a acc)
                (*^* a (- b 1) (* a acc)))))
 (display (*^* 2 8 1))
-(display (*^* 2 65536 1)) ; stack my ass
+;; (display (*^* 2 65536 1)) ; stack my ass
 
-(defmacro unless (cond iffalse iftrue)
-  (quasiquote if (unquote cond)
-              (unquote iftrue)
-              (unquote iffalse)))
+;; (defmacro unless (cond iffalse iftrue)
+;;   (quasiquote if (unquote cond)
+;;               (unquote iftrue)
+;;               (unquote iffalse)))
 
-(unless (= 1 2)
-  (display "False")
-  (display "True"))
+;; (unless (= 1 2)
+;;   (display "False")
+;;   (display "True"))
+
+(def debug (get Lua "debug"))
+(display (print (call (get debug "getinfo") 1)))
